@@ -8,7 +8,9 @@ from typing import Any, Dict, List, Optional
 
 from .audit import make_entry, utc_now
 from .domain import ConflictError, NotFoundError
-from .rules import ID_PREFIX, STATES
+from .rules import ID_PREFIX, STATES, review_deadline
+
+SCHEMA_VERSION = 2
 
 
 class Repository:
@@ -54,6 +56,33 @@ class Repository:
                     created_at TEXT NOT NULL,
                     UNIQUE(item_id, external_ref)
                 );
+                CREATE TABLE IF NOT EXISTS readings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    sampled_at TEXT NOT NULL,
+                    concentration REAL NOT NULL,
+                    limit_value REAL NOT NULL,
+                    report_no TEXT NOT NULL,
+                    is_exceedance INTEGER NOT NULL,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, report_no)
+                );
+                CREATE INDEX IF NOT EXISTS ix_readings_item_sampled
+                    ON readings(item_id, sampled_at);
+                CREATE TABLE IF NOT EXISTS reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    reading_id INTEGER NOT NULL REFERENCES readings(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ('open','closed')),
+                    due_at TEXT NOT NULL,
+                    resolved_by_reading_id INTEGER REFERENCES readings(id),
+                    resolved_at TEXT,
+                    created_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS ix_reviews_item_status
+                    ON reviews(item_id, status);
                 CREATE TABLE IF NOT EXISTS audit_events (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     action TEXT NOT NULL,
@@ -66,6 +95,9 @@ class Repository:
                     created_at TEXT NOT NULL
                 );
             """)
+            version = int(self.conn.execute("PRAGMA user_version").fetchone()[0])
+            if version < SCHEMA_VERSION:
+                self.conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
 
     @staticmethod
     def _item(row: sqlite3.Row) -> Dict[str, Any]:
@@ -156,6 +188,104 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    def get_reading_by_report_no(self, item_id: int, report_no: str) -> Optional[Dict[str, Any]]:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT * FROM readings WHERE item_id=? AND report_no=?",
+                (item_id, report_no),
+            ).fetchone()
+        return dict(row) if row is not None else None
+
+    def insert_reading(self, item_id: int, sampled_at: str, concentration: float,
+                       limit_value: float, report_no: str, is_exceedance: bool,
+                       actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        self.get_item(item_id)
+        try:
+            with self._lock, self.conn:
+                cur = self.conn.execute(
+                    """INSERT INTO readings(item_id, sampled_at, concentration, limit_value,
+                       report_no, is_exceedance, created_by, created_at)
+                       VALUES(?,?,?,?,?,?,?,?)""",
+                    (item_id, sampled_at, concentration, limit_value, report_no,
+                     1 if is_exceedance else 0, actor, now),
+                )
+                reading_id = int(cur.lastrowid)
+        except sqlite3.IntegrityError as exc:
+            raise ConflictError("报告编号已存在") from exc
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM readings WHERE id=?", (reading_id,)).fetchone()
+        return dict(row)
+
+    def open_review_for_reading(self, reading: Dict[str, Any]) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """INSERT INTO reviews(item_id, reading_id, status, due_at, created_at)
+                   VALUES(?,?,'open',?,?)""",
+                (reading["item_id"], reading["id"], review_deadline(now), now),
+            )
+            review_id = int(cur.lastrowid)
+        with self._lock:
+            row = self.conn.execute("SELECT * FROM reviews WHERE id=?", (review_id,)).fetchone()
+        return dict(row)
+
+    def close_open_reviews(self, item_id: int, reading_id: int) -> int:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                """UPDATE reviews SET status='closed', resolved_by_reading_id=?, resolved_at=?
+                   WHERE item_id=? AND status='open'""",
+                (reading_id, now, item_id),
+            )
+            return int(cur.rowcount)
+
+    def open_review_count(self, item_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM reviews WHERE item_id=? AND status='open'",
+                (item_id,),
+            ).fetchone()
+        return int(row["n"])
+
+    def next_review_deadline(self, item_id: int) -> Optional[str]:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT MIN(due_at) AS d FROM reviews
+                   WHERE item_id=? AND status='open'""",
+                (item_id,),
+            ).fetchone()
+        return row["d"] if row is not None and row["d"] is not None else None
+
+    def count_exceedances_since(self, item_id: int, window_start: str,
+                                window_end: str) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                """SELECT COUNT(*) AS n FROM readings
+                   WHERE item_id=? AND is_exceedance=1
+                     AND sampled_at>? AND sampled_at<=?""",
+                (item_id, window_start, window_end),
+            ).fetchone()
+        return int(row["n"])
+
+    def list_readings(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM readings WHERE item_id=? ORDER BY sampled_at, id",
+                (item_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def escalate_item(self, item_id: int, actor: str) -> None:
+        now = utc_now()
+        with self._lock, self.conn:
+            self.conn.execute(
+                """UPDATE items SET severity='major', version=version+1, updated_at=?
+                   WHERE id=? AND severity<>'major'""",
+                (now, item_id),
+            )
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:
