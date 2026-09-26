@@ -65,6 +65,32 @@ class Repository:
                     entry_hash TEXT NOT NULL UNIQUE,
                     created_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS readings (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    sampled_at TEXT NOT NULL,
+                    concentration REAL NOT NULL,
+                    limit_value REAL NOT NULL,
+                    report_no TEXT NOT NULL,
+                    is_exceedance INTEGER NOT NULL DEFAULT 0,
+                    created_by TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    UNIQUE(item_id, report_no)
+                );
+                CREATE INDEX IF NOT EXISTS ix_readings_item_exceedance
+                    ON readings(item_id, is_exceedance, sampled_at);
+                CREATE TABLE IF NOT EXISTS reviews (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    item_id INTEGER NOT NULL REFERENCES items(id) ON DELETE CASCADE,
+                    reading_id INTEGER NOT NULL REFERENCES readings(id) ON DELETE CASCADE,
+                    status TEXT NOT NULL DEFAULT 'open'
+                        CHECK(status IN ('open','closed')),
+                    opened_at TEXT NOT NULL,
+                    closed_at TEXT,
+                    closed_by_reading_id INTEGER REFERENCES readings(id)
+                );
+                CREATE INDEX IF NOT EXISTS ix_reviews_item_status
+                    ON reviews(item_id, status);
             """)
 
     @staticmethod
@@ -156,6 +182,121 @@ class Repository:
                 (item_id,),
             ).fetchone()
         return int(row["n"])
+
+    @staticmethod
+    def _reading(row: sqlite3.Row) -> Dict[str, Any]:
+        data = dict(row)
+        data["is_exceedance"] = bool(data["is_exceedance"])
+        return data
+
+    def register_reading(self, item_id: int, sampled_at: str, concentration: float,
+                         limit_value: float, report_no: str, is_over: bool,
+                         actor: str) -> Dict[str, Any]:
+        """登记采样读数并同步复查状态；同一报告编号重复提交沿用首次结果。"""
+        now = utc_now()
+        self.get_item(item_id)
+        with self._lock, self.conn:
+            existing = self.conn.execute(
+                "SELECT * FROM readings WHERE item_id=? AND report_no=?",
+                (item_id, report_no),
+            ).fetchone()
+            if existing is not None:
+                return {"reading": self._reading(existing), "created": False,
+                        "opened_review": None, "closed_reviews": []}
+            cur = self.conn.execute(
+                """INSERT INTO readings(item_id, sampled_at, concentration, limit_value,
+                   report_no, is_exceedance, created_by, created_at)
+                   VALUES(?,?,?,?,?,?,?,?)""",
+                (item_id, sampled_at, concentration, limit_value, report_no,
+                 1 if is_over else 0, actor, now),
+            )
+            reading_id = int(cur.lastrowid)
+            opened_review = None
+            closed_reviews: List[Dict[str, Any]] = []
+            if is_over:
+                cur = self.conn.execute(
+                    "INSERT INTO reviews(item_id, reading_id, status, opened_at)"
+                    " VALUES(?,?,'open',?)",
+                    (item_id, reading_id, now),
+                )
+                opened_review = dict(self.conn.execute(
+                    "SELECT * FROM reviews WHERE id=?", (int(cur.lastrowid),),
+                ).fetchone())
+            else:
+                # 达标读数只结清采样时刻不晚于它的未结复查
+                self.conn.execute(
+                    """UPDATE reviews SET status='closed', closed_at=?, closed_by_reading_id=?
+                       WHERE item_id=? AND status='open' AND reading_id IN (
+                           SELECT id FROM readings WHERE item_id=? AND sampled_at<=?)""",
+                    (now, reading_id, item_id, item_id, sampled_at),
+                )
+                closed_reviews = [dict(row) for row in self.conn.execute(
+                    "SELECT * FROM reviews WHERE closed_by_reading_id=?",
+                    (reading_id,),
+                ).fetchall()]
+            reading = self._reading(self.conn.execute(
+                "SELECT * FROM readings WHERE id=?", (reading_id,),
+            ).fetchone())
+        return {"reading": reading, "created": True,
+                "opened_review": opened_review, "closed_reviews": closed_reviews}
+
+    def list_readings(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM readings WHERE item_id=? ORDER BY sampled_at, id",
+                (item_id,),
+            ).fetchall()
+        return [self._reading(row) for row in rows]
+
+    def list_reviews(self, item_id: int) -> List[Dict[str, Any]]:
+        self.get_item(item_id)
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT * FROM reviews WHERE item_id=? ORDER BY id", (item_id,)
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def open_review_count(self, item_id: int) -> int:
+        with self._lock:
+            row = self.conn.execute(
+                "SELECT COUNT(*) AS n FROM reviews WHERE item_id=? AND status='open'",
+                (item_id,),
+            ).fetchone()
+        return int(row["n"])
+
+    def open_review_opened_ats(self, item_id: int) -> List[str]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT opened_at FROM reviews WHERE item_id=? AND status='open'"
+                " ORDER BY opened_at",
+                (item_id,),
+            ).fetchall()
+        return [row["opened_at"] for row in rows]
+
+    def exceedance_sampled_ats(self, item_id: int) -> List[str]:
+        with self._lock:
+            rows = self.conn.execute(
+                "SELECT sampled_at FROM readings WHERE item_id=? AND is_exceedance=1",
+                (item_id,),
+            ).fetchall()
+        return [row["sampled_at"] for row in rows]
+
+    def escalate_item(self, item_id: int, severity: str, actor: str) -> Dict[str, Any]:
+        now = utc_now()
+        with self._lock, self.conn:
+            cur = self.conn.execute(
+                "UPDATE items SET severity=?, version=version+1, updated_at=?"
+                " WHERE id=? AND severity<>?",
+                (severity, now, item_id, severity),
+            )
+            if cur.rowcount == 0:
+                exists = self.conn.execute(
+                    "SELECT 1 FROM items WHERE id=?", (item_id,)
+                ).fetchone()
+                if exists is None:
+                    raise NotFoundError("项目不存在")
+        return self.get_item(item_id)
 
     def append_audit(self, action: str, entity_type: str, entity_id: int,
                      actor: str, detail: dict) -> Dict[str, Any]:

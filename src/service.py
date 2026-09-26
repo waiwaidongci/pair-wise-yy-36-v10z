@@ -2,12 +2,16 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional
 
-from .domain import ensure_role, normalize_severity, require_number, require_text
+from .audit import parse_instant, utc_now
+from .domain import (ensure_role, normalize_severity, require_number,
+                     require_text, require_timestamp)
 from .repository import Repository
-from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, RECORD_ROLES, TITLE,
-                    VIEW_ROLES, completion_blockers, escalation_required,
-                    priority_score, response_deadline_hours, role_for_transition,
-                    validate_transition)
+from .rules import (AUDIT_ROLES, CREATE_ROLES, ENTITY, ESCALATION_TARGET,
+                    RECORD_ROLES, TITLE, VIEW_ROLES, completion_blockers,
+                    count_exceedances_within, escalation_required,
+                    is_exceedance, nearest_review_deadline, priority_score,
+                    response_deadline_hours, role_for_transition,
+                    should_escalate, validate_transition)
 
 
 class Service:
@@ -63,7 +67,9 @@ class Service:
         ensure_role(role, role_for_transition(target))
         if not isinstance(expected_version, int) or expected_version < 1:
             raise ValueError("expected_version必须是正整数")
-        blockers = completion_blockers(target, self.repository.open_record_count(item_id))
+        blockers = completion_blockers(target,
+                                       self.repository.open_record_count(item_id),
+                                       self.repository.open_review_count(item_id))
         if blockers:
             from .domain import ConflictError
             raise ConflictError("；".join(blockers))
@@ -74,6 +80,49 @@ class Service:
                 item["severity"], item["quantity"], item["threshold"]),
         })
         return self.enrich(updated)
+
+    def add_reading(self, item_id: int, payload: Dict[str, Any], actor: str,
+                    role: str) -> Dict[str, Any]:
+        ensure_role(role, RECORD_ROLES)
+        actor = require_text(actor, "actor", 100)
+        sampled_at = require_timestamp(payload.get("sampled_at"), "sampled_at")
+        concentration = require_number(payload.get("concentration"), "concentration")
+        limit_value = require_number(payload.get("limit_value"), "limit_value", 0.000001)
+        report_no = require_text(payload.get("report_no"), "report_no", 100)
+        over = is_exceedance(concentration, limit_value)
+        outcome = self.repository.register_reading(
+            item_id, sampled_at, concentration, limit_value, report_no, over, actor)
+        reading = outcome["reading"]
+        reading["created"] = outcome["created"]
+        if not outcome["created"]:
+            return reading
+        self.repository.append_audit("reading", ENTITY, item_id, actor, {
+            "reading_id": reading["id"], "report_no": report_no,
+            "sampled_at": sampled_at, "concentration": concentration,
+            "limit_value": limit_value, "is_exceedance": over,
+        })
+        if outcome["opened_review"] is not None:
+            self.repository.append_audit("review_open", ENTITY, item_id, actor, {
+                "review_id": outcome["opened_review"]["id"],
+                "reading_id": reading["id"],
+            })
+        if outcome["closed_reviews"]:
+            self.repository.append_audit("review_close", ENTITY, item_id, actor, {
+                "review_ids": [r["id"] for r in outcome["closed_reviews"]],
+                "closed_by_reading_id": reading["id"],
+            })
+        if over:
+            item = self.repository.get_item(item_id)
+            count = count_exceedances_within(
+                [parse_instant(s) for s in self.repository.exceedance_sampled_ats(item_id)],
+                parse_instant(sampled_at))
+            if should_escalate(count) and item["severity"] != ESCALATION_TARGET:
+                self.repository.escalate_item(item_id, ESCALATION_TARGET, actor)
+                self.repository.append_audit("escalate", ENTITY, item_id, actor, {
+                    "from": item["severity"], "to": ESCALATION_TARGET,
+                    "exceedance_count_30d": count,
+                })
+        return reading
 
     def get_item(self, item_id: int, role: str) -> Dict[str, Any]:
         self._view(role)
@@ -87,17 +136,33 @@ class Service:
         self._view(role)
         return self.repository.list_records(item_id)
 
+    def list_readings(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_readings(item_id)
+
+    def list_reviews(self, item_id: int, role: str) -> list:
+        self._view(role)
+        return self.repository.list_reviews(item_id)
+
     def audit(self, role: str, item_id: Optional[int] = None) -> list:
         ensure_role(role, AUDIT_ROLES)
         return self.repository.list_audit(item_id)
 
-    @staticmethod
-    def enrich(item: Dict[str, Any]) -> Dict[str, Any]:
+    def enrich(self, item: Dict[str, Any]) -> Dict[str, Any]:
         result = dict(item)
+        hours = response_deadline_hours(
+            item["severity"], item["quantity"], item["threshold"])
         result["priority"] = priority_score(
             item["severity"], item["quantity"], item["threshold"])
-        result["deadline_hours"] = response_deadline_hours(
-            item["severity"], item["quantity"], item["threshold"])
+        result["deadline_hours"] = hours
         result["escalation_required"] = escalation_required(
             item["severity"], item["quantity"], item["threshold"])
+        result["exceedance_count_30d"] = count_exceedances_within(
+            [parse_instant(s) for s in self.repository.exceedance_sampled_ats(item["id"])],
+            parse_instant(utc_now()))
+        result["current_level"] = item["severity"]
+        opened = [parse_instant(t) for t in
+                  self.repository.open_review_opened_ats(item["id"])]
+        result["open_reviews"] = len(opened)
+        result["nearest_deadline"] = nearest_review_deadline(opened, hours)
         return result

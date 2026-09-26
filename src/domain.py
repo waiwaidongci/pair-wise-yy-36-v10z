@@ -1,6 +1,7 @@
 from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Dict, Optional
+from .audit import parse_instant
 class ErrorKind:
     VALIDATION="validation"; NOT_FOUND="not_found"; FORBIDDEN="forbidden"; CONFLICT="conflict"
 class DomainError(Exception):
@@ -20,6 +21,12 @@ class Record:
 @dataclass(frozen=True)
 class AuditEntry:
     id:int; action:str; entity_type:str; entity_id:int; actor:str; detail:Dict[str,Any]; previous_hash:str; entry_hash:str; created_at:str
+@dataclass(frozen=True)
+class Reading:
+    id:int; item_id:int; sampled_at:str; concentration:float; limit_value:float; report_no:str; is_exceedance:bool; created_by:str; created_at:str
+@dataclass(frozen=True)
+class Review:
+    id:int; item_id:int; reading_id:int; status:str; opened_at:str; closed_at:Optional[str]; closed_by_reading_id:Optional[int]
 def require_text(value,field,max_length=2000):
     if not isinstance(value,str) or not value.strip(): raise ValidationError(f"{field}不能为空")
     value=value.strip()
@@ -34,5 +41,10 @@ def require_number(value,field,minimum=0.0):
     except (TypeError,ValueError): raise ValidationError(f"{field}必须是数字")
     if number<minimum: raise ValidationError(f"{field}不能小于{minimum}")
     return number
+def require_timestamp(value,field):
+    text=require_text(value,field,100)
+    try: instant=parse_instant(text)
+    except ValueError as exc: raise ValidationError(f"{field}必须是有效的ISO时间") from exc
+    return instant.replace(microsecond=0).isoformat()
 def ensure_role(role,allowed):
     if role not in allowed: raise PermissionDenied("当前角色无权执行该操作")
